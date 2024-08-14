@@ -1,12 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"flag"
 	"fmt"
 	"log"
 	"os"
 	"os/exec"
 	"os/signal"
+	"path"
 	"strings"
 	"syscall"
 
@@ -16,9 +18,9 @@ import (
 func main() {
 	outputPointer := flag.String("o", "", "directory to output server.go. Default is $GOPATH/src/grpc/")
 	grpcPort := flag.String("grpc-port", "4770", "Port of gRPC tcp server")
-	grpcBindAddr := flag.String("grpc-listen", "", "Adress the gRPC server will bind to. Default to localhost, set to 0.0.0.0 to use from another machine")
+	grpcBindAddr := flag.String("grpc-listen", "", "Address the gRPC server will bind to. Default to localhost, set to 0.0.0.0 to use from another machine")
 	adminport := flag.String("admin-port", "4771", "Port of stub admin server")
-	adminBindAddr := flag.String("admin-listen", "", "Adress the admin server will bind to. Default to localhost, set to 0.0.0.0 to use from another machine")
+	adminBindAddr := flag.String("admin-listen", "", "Address the admin server will bind to. Default to localhost, set to 0.0.0.0 to use from another machine")
 	stubPath := flag.String("stub", "", "Path where the stub files are (Optional)")
 	imports := flag.String("imports", "/protobuf", "comma separated imports path. default path /protobuf is where gripmock Dockerfile install WKT protos")
 	// for backwards compatibility
@@ -68,27 +70,18 @@ func main() {
 		imports:     importDirs,
 	})
 
-	// build the server
-	//buildServer(output)
-
 	// and run
 	run, runerr := runGrpcServer(output)
 
-	var term = make(chan os.Signal)
+	term := make(chan os.Signal)
 	signal.Notify(term, syscall.SIGTERM, syscall.SIGKILL, syscall.SIGINT)
 	select {
 	case err := <-runerr:
 		log.Fatal(err)
 	case <-term:
 		fmt.Println("Stopping gRPC Server")
-		run.Process.Kill()
+		_ = run.Process.Kill()
 	}
-}
-
-func getProtoName(path string) string {
-	paths := strings.Split(path, "/")
-	filename := paths[len(paths)-1]
-	return strings.Split(filename, ".")[0]
 }
 
 type protocParam struct {
@@ -100,17 +93,45 @@ type protocParam struct {
 	imports     []string
 }
 
-func generateProtoc(param protocParam) {
-	protodirs := strings.Split(param.protoPath[0], "/")
+func getProtodirs(protoPath string, imports []string) []string {
+	// deduced protodir from protoPath
+	splitpath := strings.Split(protoPath, "/")
 	protodir := ""
-	if len(protodirs) > 0 {
-		protodir = strings.Join(protodirs[:len(protodirs)-1], "/") + "/"
+	if len(splitpath) > 0 {
+		protodir = path.Join(splitpath[:len(splitpath)-1]...)
 	}
 
-	args := []string{"-I", protodir}
-	// include well-known-types
-	for _, i := range param.imports {
-		args = append(args, "-I", i)
+	// search protodir prefix
+	protodirIdx := -1
+	for i := range imports {
+		dir := path.Join("protogen", imports[i])
+		if strings.HasPrefix(protodir, dir) {
+			protodir = dir
+			protodirIdx = i
+			break
+		}
+	}
+
+	protodirs := make([]string, 0, len(imports)+1)
+	protodirs = append(protodirs, protodir)
+	// include all dir in imports, skip if it has been added before
+	for i, dir := range imports {
+		if i == protodirIdx {
+			continue
+		}
+		protodirs = append(protodirs, dir)
+	}
+	return protodirs
+}
+
+func generateProtoc(param protocParam) {
+	param.protoPath = fixGoPackage(param.protoPath)
+	protodirs := getProtodirs(param.protoPath[0], param.imports)
+
+	// estimate args length to prevent expand
+	args := make([]string, 0, len(protodirs)+len(param.protoPath)+2)
+	for _, dir := range protodirs {
+		args = append(args, "-I", dir)
 	}
 
 	// the latest go-grpc plugin will generate subfolders under $GOPATH/src based on go_package option
@@ -127,19 +148,21 @@ func generateProtoc(param protocParam) {
 	if err != nil {
 		log.Fatal("Fail on protoc ", err)
 	}
-
 }
 
-func buildServer(output string) {
-	args := []string{"build", "-o", output + "grpcserver", output}
-
-	build := exec.Command("go", args...)
-	build.Stdout = os.Stdout
-	build.Stderr = os.Stderr
-	err := build.Run()
+// append gopackage in proto files if doesn't have any
+func fixGoPackage(protoPaths []string) []string {
+	fixgopackage := exec.Command("fix_gopackage.sh", protoPaths...)
+	buf := &bytes.Buffer{}
+	fixgopackage.Stdout = buf
+	fixgopackage.Stderr = os.Stderr
+	err := fixgopackage.Run()
 	if err != nil {
-		log.Fatal(err)
+		log.Println("error on fixGoPackage", err)
+		return protoPaths
 	}
+
+	return strings.Split(strings.TrimRight(buf.String(), "\n"), "\n")
 }
 
 func runGrpcServer(output string) (*exec.Cmd, <-chan error) {

@@ -6,11 +6,10 @@ import (
 	"os"
 	"time"
 
-	pb "github.com/tokopedia/gripmock/example/simple"
+	pb "github.com/tokopedia/gripmock/protogen/example/simple"
 	"google.golang.org/grpc"
 )
 
-//go:generate protoc -I=.. --go_out=plugins=grpc:${GOPATH}/src ../simple.proto
 func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
 	defer cancel()
@@ -34,4 +33,23 @@ func main() {
 		log.Fatalf("error from grpc: %v", err)
 	}
 	log.Printf("Greeting: %s (return code %d)", r.Message, r.ReturnCode)
+
+	name = "world"
+	r, err = c.SayHello(context.Background(), &pb.Request{Name: name})
+	if err != nil {
+		log.Fatalf("error from grpc: %v", err)
+	}
+	log.Printf("Greeting: %s (return code %d)", r.Message, r.ReturnCode)
+	name = "error"
+	r, err = c.SayHello(context.Background(), &pb.Request{Name: name})
+	if err == nil {
+		log.Fatalf("Expected error, but return %d", r.ReturnCode)
+	}
+	log.Printf("Greeting error: %s", err)
+	name = "error_code"
+	r, err = c.SayHello(context.Background(), &pb.Request{Name: name})
+	if err == nil {
+		log.Fatalf("Expected error, but return %d", r.ReturnCode)
+	}
+	log.Printf("Greeting error: %s", err)
 }

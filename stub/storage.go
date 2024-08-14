@@ -1,12 +1,14 @@
 package stub
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"log"
+	"os"
 	"reflect"
 	"regexp"
+	"sort"
 	"sync"
 
 	"github.com/lithammer/fuzzysearch/fuzzy"
@@ -27,6 +29,10 @@ type storage struct {
 }
 
 func storeStub(stub *Stub) error {
+	return stubStorage.storeStub(stub)
+}
+
+func (sm *stubMapping) storeStub(stub *Stub) error {
 	mx.Lock()
 	defer mx.Unlock()
 
@@ -34,10 +40,10 @@ func storeStub(stub *Stub) error {
 		Input:  stub.Input,
 		Output: stub.Output,
 	}
-	if stubStorage[stub.Service] == nil {
-		stubStorage[stub.Service] = make(map[string][]storage)
+	if (*sm)[stub.Service] == nil {
+		(*sm)[stub.Service] = make(map[string][]storage)
 	}
-	stubStorage[stub.Service][stub.Method] = append(stubStorage[stub.Service][stub.Method], strg)
+	(*sm)[stub.Service][stub.Method] = append((*sm)[stub.Service][stub.Method], strg)
 	return nil
 }
 
@@ -56,11 +62,11 @@ func findStub(stub *findStubPayload) (*Output, error) {
 	mx.Lock()
 	defer mx.Unlock()
 	if _, ok := stubStorage[stub.Service]; !ok {
-		return nil, fmt.Errorf("Can't find stub for Service: %s", stub.Service)
+		return nil, fmt.Errorf("can't find stub for Service: %s", stub.Service)
 	}
 
 	if _, ok := stubStorage[stub.Service][stub.Method]; !ok {
-		return nil, fmt.Errorf("Can't find stub for Service:%s and Method:%s", stub.Service, stub.Method)
+		return nil, fmt.Errorf("can't find stub for Service:%s and Method:%s", stub.Service, stub.Method)
 	}
 
 	stubs := stubStorage[stub.Service][stub.Method]
@@ -73,6 +79,13 @@ func findStub(stub *findStubPayload) (*Output, error) {
 		if expect := stubrange.Input.Equals; expect != nil {
 			closestMatch = append(closestMatch, closeMatch{"equals", expect})
 			if equals(stub.Data, expect) {
+				return &stubrange.Output, nil
+			}
+		}
+
+		if expect := stubrange.Input.EqualsUnordered; expect != nil {
+			closestMatch = append(closestMatch, closeMatch{"equals_unordered", expect})
+			if equalsUnordered(stub.Data, expect) {
 				return &stubrange.Output, nil
 			}
 		}
@@ -167,29 +180,58 @@ func deepEqual(expect, actual interface{}) bool {
 }
 
 func regexMatch(expect, actual interface{}) bool {
-	match, err := regexp.Match(expect.(string), []byte(actual.(string)))
-	if err != nil {
-		log.Printf("Error on matching regex %s with %s error:%v\n", expect, actual, err)
+	expectedStr, expectedStringOk := expect.(string)
+	actualStr, actualStringOk := actual.(string)
+
+	if expectedStringOk && actualStringOk {
+		match, err := regexp.Match(expectedStr, []byte(actualStr))
+		if err != nil {
+			log.Printf("Error on matching regex %s with %s error:%v\n", expect, actual, err)
+		}
+		return match
 	}
-	return match
+
+	return deepEqual(expect, actual)
 }
 
 func equals(expect, actual map[string]interface{}) bool {
-	return find(expect, actual, true, true, deepEqual)
+	return find(expect, actual, true, true, deepEqual, false)
+}
+
+func equalsUnordered(expect, actual map[string]interface{}) bool {
+	return find(expect, actual, true, true, deepEqual, true)
 }
 
 func contains(expect, actual map[string]interface{}) bool {
-	return find(expect, actual, true, false, deepEqual)
+	return find(expect, actual, true, false, deepEqual, false)
 }
 
 func matches(expect, actual map[string]interface{}) bool {
-	return find(expect, actual, true, false, regexMatch)
+	return find(expect, actual, true, false, regexMatch, false)
 }
 
-func find(expect, actual interface{}, acc, exactMatch bool, f matchFunc) bool {
+func equalsIgnoreOrder(expect, actual interface{}) bool {
+	expectSlice, expectOk := expect.([]interface{})
+	actualSlice, actualOk := actual.([]interface{})
+	if !expectOk || !actualOk {
+		return false
+	}
+	if len(expectSlice) != len(actualSlice) {
+		return false
+	}
+	sort.Slice(expectSlice, func(i, j int) bool {
+		return fmt.Sprint(expectSlice[i]) < fmt.Sprint(expectSlice[j])
+	})
+	sort.Slice(actualSlice, func(i, j int) bool {
+		return fmt.Sprint(actualSlice[i]) < fmt.Sprint(actualSlice[j])
+	})
+	return reflect.DeepEqual(expectSlice, actualSlice)
+}
+
+func find(expect, actual interface{}, acc, exactMatch bool, f matchFunc, ignoreOrder bool) bool {
 
 	// circuit brake
-	if acc == false {
+	if !acc {
 		return false
 	}
 
@@ -214,9 +256,13 @@ func find(expect, actual interface{}, acc, exactMatch bool, f matchFunc) bool {
 			}
 		}
 
+		if expectArrayOk && actualArrayOk && ignoreOrder {
+			return equalsIgnoreOrder(expectArrayValue, actualArrayValue)
+		}
+
 		for expectItemIndex, expectItemValue := range expectArrayValue {
 			actualItemValue := actualArrayValue[expectItemIndex]
-			acc = find(expectItemValue, actualItemValue, acc, exactMatch, f)
+			acc = find(expectItemValue, actualItemValue, acc, exactMatch, f, ignoreOrder)
 		}
 
 		return acc
@@ -245,7 +291,7 @@ func find(expect, actual interface{}, acc, exactMatch bool, f matchFunc) bool {
 
 		for expectItemKey, expectItemValue := range expectMapValue {
 			actualItemValue := actualMapValue[expectItemKey]
-			acc = find(expectItemValue, actualItemValue, acc, exactMatch, f)
+			acc = find(expectItemValue, actualItemValue, acc, exactMatch, f, ignoreOrder)
 		}
 
 		return acc
@@ -262,7 +308,11 @@ func clearStorage() {
 }
 
 func readStubFromFile(path string) {
-	files, err := ioutil.ReadDir(path)
+	stubStorage.readStubFromFile(path)
+}
+
+func (sm *stubMapping) readStubFromFile(path string) {
+	files, err := os.ReadDir(path)
 	if err != nil {
 		log.Printf("Can't read stub from %s. %v\n", path, err)
 		return
@@ -274,19 +324,38 @@ func readStubFromFile(path string) {
 			continue
 		}
 
-		byt, err := ioutil.ReadFile(path + "/" + file.Name())
+		byt, err := os.ReadFile(path + "/" + file.Name())
 		if err != nil {
 			log.Printf("Error when reading file %s. %v. skipping...", file.Name(), err)
+			continue
+		}
+
+		// most files have a trailing newline so trim that before checking
+		byt = bytes.TrimSuffix(byt, []byte("\n"))
+		if byt[0] == '[' && byt[len(byt)-1] == ']' {
+			var stubs []*Stub
+			err = json.Unmarshal(byt, &stubs)
+			if err != nil {
+				log.Printf("Error when unmarshalling file %s. %v. skipping...", file.Name(), err)
+				continue
+			}
+			for _, s := range stubs {
+				if err = sm.storeStub(s); err != nil {
+					log.Printf("Error when storing Stub from %s. %v. skipping...", file.Name(), err)
+				}
+			}
 			continue
 		}
 
 		stub := new(Stub)
 		err = json.Unmarshal(byt, stub)
 		if err != nil {
-			log.Printf("Error when reading file %s. %v. skipping...", file.Name(), err)
+			log.Printf("Error when unmarshalling file %s. %v. skipping...", file.Name(), err)
 			continue
 		}
 
-		storeStub(stub)
+		if err = sm.storeStub(stub); err != nil {
+			log.Printf("Error when storing Stub from %s. %v. skipping...", file.Name(), err)
+		}
 	}
 }
